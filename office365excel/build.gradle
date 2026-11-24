@@ -1,0 +1,433 @@
+plugins {
+    id "jacoco"
+    id 'java'
+    id 'maven-publish'
+    id("org.sonarqube") version "6.3.1.5724"
+}
+
+apply plugin: 'java-library'
+
+sonar {
+    properties {
+        property('sonar.projectName', 'SonarScanner for Krista Global Catalog (office365excel-3.0 with Jacoco code coverage)')
+        property("sonar.projectKey", "sonar-scanner-office365excel-3.0")
+        property("sonar.sources", "src/main/java")
+        property("sonar.tests", "src/test/java")
+        property("sonar.java.binaries", "build/classes/java/main")
+        property("sonar.java.test.binaries", "build/classes/java/test")
+        property("sonar.coverage.jacoco.xmlReportPaths", "build/reports/jacoco/test/jacocoTestReport.xml")
+        property("sonar.junit.reportPaths", "build/test-results/test")
+    }
+}
+
+group = 'app.krista.extensions.essentials.spreadsheets'
+
+/*
+ * Use extension.name for archiveBaseName, extension.version for version.
+ * Resulting jar: <extension.name>-<extension.version>.jar e.g. Office365Excel-3.0.0.jar
+ */
+def computedBaseName = "Office365Excel"
+def computedVersion = "local"
+def releasePropsFile = file('release.properties')
+if (releasePropsFile.exists()) {
+    def props = new Properties()
+    releasePropsFile.withInputStream { stream -> props.load(stream) }
+    // Remove whitespace for base name, but allow dashes/underscores
+    computedBaseName = (props['extension.name'] ?: "Office365Excel").replaceAll(/\s+/, "")
+    computedVersion = props['extension.version'] ?: "local"
+}
+version = computedVersion
+
+
+if (rootProject.file('builder.txt').canRead()) {
+    ext.builder = rootProject.file('builder.txt').text.trim()
+} else {
+    ext.builder = "0"
+}
+
+// Node/Yarn no longer needed — auth tab is pre-built HTML from SDK JAR
+
+
+task updateVersion {
+    doFirst {
+        project.ext.newbuilder = Integer.parseInt(project.ext.builder) + 1
+        print "Building extension version: " + version.toString() + "-" + project.ext.newbuilder
+        rootProject.file('builder.txt').text = project.ext.newbuilder
+        System.clearProperty("extensionVersion")
+        System.setProperty("extensionVersion", version.toString() + "-" + project.ext.newbuilder)
+    }
+}
+
+System.setProperty("extensionVersion", version.toString())
+
+java {
+    sourceCompatibility = JavaVersion.VERSION_21
+    targetCompatibility = JavaVersion.VERSION_21
+}
+
+repositories {
+    mavenLocal()
+    maven {
+        url = "https://packages.cicd.in.antbrains.com/artifactory/libs-release"
+    }
+    mavenCentral()
+}
+
+tasks.withType(JavaCompile).configureEach {
+    options.encoding = 'UTF-8'
+    options.compilerArgs << '-Xlint:all,-serial'
+}
+
+tasks.register('compile') {
+    dependsOn compileJava
+}
+
+tasks.named('processResources') {
+    dependsOn(tasks.named('extractSDKResources'))
+}
+
+tasks.named('compileTestJava') {
+    dependsOn(tasks.named('extractSDKResources'))
+}
+
+test {
+    useJUnitPlatform()
+    finalizedBy jacocoTestReport // Generate coverage report after tests run
+
+    // Add these settings to help diagnose test issues
+    testLogging {
+        events "passed", "skipped", "failed"
+        exceptionFormat = "full"
+    }
+
+    // Enable experimental support for Java 23 in Byte Buddy
+    jvmArgs '-Dnet.bytebuddy.experimental=true'
+
+    // Use a different mocking strategy
+    systemProperty 'mockito.mock.maker', 'subclass'
+
+    // Increase memory if needed
+    maxHeapSize = "1G"
+}
+
+dependencies {
+    annotationProcessor 'app.krista:extension-impl-anno-processors:1.0.125-sp1'
+    implementation 'app.krista:krista-apis:1.0.125-sp1'
+    implementation 'org.glassfish.hk2:hk2-api:3.0.3'
+    implementation 'org.apache.logging.log4j:log4j-slf4j-impl:2.20.0'
+    compileOnly 'org.apache.logging.log4j:log4j-core:2.20.0'
+
+    // Microsoft Auth SDK — core auth + extension API (base classes, annotations, registry)
+    implementation 'app.krista.sdk:microsoft-auth-sdk:1.0.5'
+
+    implementation 'com.microsoft.graph:microsoft-graph:5.76.0'
+    implementation 'com.microsoft.graph:microsoft-graph-auth:0.3.0'
+    implementation 'com.azure:azure-identity:1.11.0'
+    implementation 'org.glassfish.jersey.media:jersey-media-multipart:2.35'
+    implementation 'org.jsoup:jsoup:1.16.1'
+    implementation group: 'commons-validator', name: 'commons-validator', version: '1.7'
+    implementation 'commons-io:commons-io:2.11.0'
+    implementation 'org.apache.commons:commons-lang3:3.12.0'
+
+    testImplementation 'com.kristasoft.common:common-test:1.0.39'
+    testImplementation 'app.krista:krista-apis:1.0.118'
+    testImplementation 'org.junit.jupiter:junit-jupiter-api:5.9.2'
+    testImplementation 'org.junit.jupiter:junit-jupiter-engine:5.9.2'
+    testImplementation 'org.junit.jupiter:junit-jupiter-params:5.9.2'
+    testImplementation 'org.mockito:mockito-core:5.10.0'
+    testImplementation 'org.mockito:mockito-junit-jupiter:5.10.0'
+    testRuntimeOnly 'org.junit.platform:junit-platform-launcher:1.10.0'
+}
+
+tasks.register('createSourceDir', Exec) {
+    dependsOn processResources
+    commandLine "mkdir", "-p", "$projectDir/build/classes/java/main/META-INF/project"
+}
+
+tasks.register('copyGradleFile', Exec) {
+    dependsOn createSourceDir
+    commandLine "cp", "$projectDir/build.gradle", "$projectDir/build/classes/java/main/META-INF/project/build.gradle"
+}
+
+tasks.register('includeSources', Exec) {
+    dependsOn copyGradleFile
+    commandLine "cp", "-r", "$projectDir/src", "$projectDir/build/classes/java/main/META-INF/project/src"
+}
+
+tasks.register('candidate', Exec) {
+    commandLine "env",
+            "DOCKER_UPLOAD_REPO=" + rootProject.properties['DOCKER_UPLOAD_REPO'],
+            "MAVEN_URL=" + System.properties['MAVEN_URL'],
+            "MAVEN_UPLOAD_URL=" + rootProject.properties['MAVEN_UPLOAD_URL'],
+            "MAVEN_USERNAME=" + rootProject.properties['MAVEN_USERNAME'],
+            "MAVEN_PASSWORD=" + rootProject.properties['MAVEN_PASSWORD'],
+            "bash", "candidate.sh"
+    standardOutput = new ByteArrayOutputStream()
+    ext.output = {
+        return standardOutput.toString()
+    }
+}
+
+tasks.register('release', Exec) {
+    commandLine "env",
+            "DOCKER_UPLOAD_REPO=" + rootProject.properties['DOCKER_UPLOAD_REPO'],
+            "MAVEN_URL=" + System.properties['MAVEN_URL'],
+            "MAVEN_UPLOAD_URL=" + rootProject.properties['MAVEN_UPLOAD_URL'],
+            "MAVEN_USERNAME=" + rootProject.properties['MAVEN_USERNAME'],
+            "MAVEN_PASSWORD=" + rootProject.properties['MAVEN_PASSWORD'],
+            "bash", "release.sh"
+    standardOutput = new ByteArrayOutputStream()
+    ext.output = {
+        return standardOutput.toString()
+    }
+}
+
+// Extract shared UI sources from microsoft-auth-sdk JAR into build resources.
+// The SDK JAR bundles auth/index.html and audit/index.html as resources.
+configurations {
+    sdkUi {
+        canBeResolved = true
+        transitive = false
+    }
+}
+dependencies {
+    sdkUi 'app.krista.sdk:microsoft-auth-sdk:1.0.5'
+}
+// Extract pre-built auth + audit HTML from SDK JAR into build resources.
+// No React build, no Node/Yarn — the SDK JAR contains ready-to-serve HTML.
+tasks.register('extractSDKResources', Copy) {
+    def sdkJar = configurations.sdkUi.singleFile
+    from(zipTree(sdkJar)) {
+        include 'auth/index.html'
+        include 'audit/index.html'
+    }
+    into("${project.buildDir}/resources/main")
+    includeEmptyDirs = false
+}
+
+// Legacy task names kept for backward compatibility with CI/build scripts
+tasks.register('buildAndCopyUI') {
+    dependsOn(tasks.named('extractSDKResources'))
+}
+
+tasks.register('buildUI') {
+    dependsOn(tasks.named('extractSDKResources'))
+}
+
+
+import java.util.regex.Pattern
+
+tasks.register('generateReleaseProperties') {
+    group = 'build'
+    description = 'Generates release.properties file with extension version and domain information'
+
+    doLast {
+        def extensionFilePath = 'src/main/java/app/krista/extensions/essentials/spreadsheets/office365excel/Office365ExcelExtension.java'
+        def sheetAreaFilePath = 'src/main/java/app/krista/extensions/essentials/spreadsheets/office365excel/catalog/SheetArea.java'
+        def tableAreaFilePath = 'src/main/java/app/krista/extensions/essentials/spreadsheets/office365excel/catalog/TableArea.java'
+        def sharedAreaFilePath = 'src/main/java/app/krista/extensions/essentials/spreadsheets/office365excel/catalog/SharedArea.java'
+
+        def extensionFile = file(extensionFilePath)
+        def sheetAreaFile = file(sheetAreaFilePath)
+        def tableAreaFile = file(tableAreaFilePath)
+        def sharedAreaFile = file(sharedAreaFilePath)
+
+        if (!extensionFile.exists()) {
+            throw new GradleException("Extension file not found: ${extensionFilePath}")
+        }
+
+        // Check that at least one area file exists
+        if (!sheetAreaFile.exists() && !tableAreaFile.exists() && !sharedAreaFile.exists()) {
+            throw new GradleException("None of the area files found. At least one must exist.")
+        }
+
+        def properties = new Properties()
+        // Pre-compile the regex pattern for better performance
+        def keyValuePattern = Pattern.compile(/(\w+)\s*=\s*"([^"]+)"/)
+
+        // Extract Extension annotation information
+        extractAnnotationInfo(extensionFile, "@Extension", keyValuePattern) { key, value ->
+            if (key == "version") {
+                properties.setProperty("extension.version", value)
+                logger.lifecycle("Found extension version: ${value}")
+            } else if (key == "name") {
+                properties.setProperty("extension.name", value)
+                logger.lifecycle("Found extension name: ${value}")
+            }
+        }
+
+        // Set default extension name if not found
+        if (!properties.getProperty('extension.name')) {
+            properties.setProperty("extension.name", "Office 365 Excel - 3.0")
+            logger.lifecycle("Set default extension name: Office 365 Excel - 3.0")
+        }
+
+        // Try to extract Domain annotation information from all area files
+        def domainFound = false
+        def ecosystemFound = false
+
+        // Check each area file if it exists
+        [sheetAreaFile, tableAreaFile, sharedAreaFile].each { areaFile ->
+            if (areaFile.exists()) {
+                extractAnnotationInfo(areaFile, "@Domain", keyValuePattern) { key, value ->
+                    if (key == "name" && !domainFound) {
+                        properties.setProperty("domain.name", value)
+                        logger.lifecycle("Found domain name: ${value} from ${areaFile.name}")
+                        domainFound = true
+                    } else if (key == "ecosystemName" && !ecosystemFound) {
+                        properties.setProperty("ecosystem.name", value)
+                        logger.lifecycle("Found ecosystem name: ${value} from ${areaFile.name}")
+                        ecosystemFound = true
+                    }
+                }
+            }
+        }
+
+        if (!properties.getProperty('extension.version')) {
+            throw new GradleException("Could not find extension version in ${extensionFilePath}")
+        }
+
+        // Set default values if not found in annotations
+        if (!properties.getProperty('domain.name')) {
+            properties.setProperty("domain.name", "Spreadsheets")
+            logger.lifecycle("Set default domain name: Spreadsheets")
+        }
+
+        if (!properties.getProperty('ecosystem.name')) {
+            properties.setProperty("ecosystem.name", "Essentials")
+            logger.lifecycle("Set default ecosystem name: Essentials")
+        }
+
+        def releasePropertiesFile = file('release.properties')
+        def content = properties.collect { key, value -> "${key}=${value}" }.join('\n')
+        releasePropertiesFile.text = content + '\n'
+        logger.lifecycle("Generated release.properties with content:\n${content}")
+    }
+}
+
+// Helper method to extract annotation information
+def extractAnnotationInfo(File file, String annotationName, Pattern keyValuePattern, Closure processProperty) {
+    StringBuilder annotationText = new StringBuilder()
+    boolean inAnnotation = false
+    file.eachLine { line ->
+        line = line.trim()
+        if (line.contains(annotationName)) {
+            inAnnotation = true
+            annotationText.setLength(0) // Reset the buffer when starting a new annotation
+            annotationText.append(line)
+        } else if (inAnnotation) {
+            annotationText.append(line)
+        }
+
+        if (inAnnotation && line.contains(")")) {
+            inAnnotation = false
+            def matcher = keyValuePattern.matcher(annotationText.toString())
+            while (matcher.find()) {
+                def key = matcher.group(1)
+                def value = matcher.group(2)
+                processProperty.call(key, value)
+            }
+        }
+    }
+}
+
+tasks.named("jar") {
+    dependsOn tasks.named("generateReleaseProperties")
+    dependsOn tasks.named("buildAndCopyUI")
+}
+jar {
+    // Without this dependency, the jar task may use the fallback "local" value if the file is not available during configuration.
+    archiveBaseName.set(computedBaseName)
+
+    doFirst {
+        // Wait for half a second to ensure generateReleaseProperties file is fully generated
+        println "Waiting half second for generateReleaseProperties to complete..."
+        Thread.sleep(500)
+        println "Wait complete, proceeding with jar creation..."
+
+        // Re-read the release.properties file at execution time to get the correct values
+        def jarReleasePropsFile = file('release.properties')
+        if (jarReleasePropsFile.exists()) {
+            def props = new Properties()
+            jarReleasePropsFile.withInputStream { stream -> props.load(stream) }
+            // Use extension.name if available, otherwise fall back to default
+            def actualBaseName = (props['extension.name'] ?: "Office365Excel").replaceAll(/\s+/, "")
+            def actualVersion = props['extension.version'] ?: "local"
+
+            println "Using jar name from release.properties: ${actualBaseName}-${actualVersion}.jar"
+
+            // Update the archive base name and version at execution time
+            archiveBaseName.set(actualBaseName)
+            archiveVersion.set(actualVersion)
+        } else {
+            println "release.properties not found, using fallback values"
+        }
+    }
+
+    manifest {}
+    from {
+        configurations.runtimeClasspath.collect {
+            it.isDirectory() ? it : zipTree(it)
+        }
+    }
+    exclude 'META-INF/*.RSA', 'META-INF/*.SF', 'META-INF/*.DSA'
+    duplicatesStrategy = "exclude"
+}
+
+tasks.withType(Test).configureEach {
+    doFirst {
+        def byteBuddyAgent = configurations.testRuntimeClasspath.find { it.name.contains('byte-buddy-agent') }
+        if (byteBuddyAgent) {
+            jvmArgs "-javaagent:${byteBuddyAgent}"
+        }
+    }
+}
+
+// Add a task to create the mockito-extensions directory and file
+tasks.register('createMockitoExtensions') {
+    doLast {
+        def mockitoDir = file("${project.projectDir}/src/test/resources/mockito-extensions")
+        mockitoDir.mkdirs()
+        def mockMakerFile = file("${mockitoDir}/org.mockito.plugins.MockMaker")
+        mockMakerFile.text = 'mock-maker-inline\n'
+        println "Created mockito-extensions directory and MockMaker file"
+    }
+}
+
+// Make sure the test task depends on createMockitoExtensions
+tasks.named('test') {
+    dependsOn tasks.named('createMockitoExtensions')
+}
+
+// Make sure the jar task doesn't depend on test
+tasks.named('jar') {
+    // Remove dependency on test if it exists
+    // Keep other dependencies
+    dependsOn tasks.named('generateReleaseProperties')
+    dependsOn tasks.named('buildAndCopyUI')
+}
+
+jacoco {
+    toolVersion = "0.8.11"
+}
+
+jacocoTestReport {
+    dependsOn test // Tests are required to run before generating the report
+    reports {
+        xml.required = true // Required for SonarQube
+        html.required = true // Nice to have for local viewing
+        csv.required = false
+    }
+    afterEvaluate {
+        classDirectories.setFrom(files(classDirectories.files.collect {
+            fileTree(dir: it, exclude: [
+                    '**/Office365ExcelExtension.class'
+            ])
+        }))
+    }
+}
+
+// Make sonar task depend on jacocoTestReport
+tasks.named('sonar') {
+    dependsOn jacocoTestReport
+}
