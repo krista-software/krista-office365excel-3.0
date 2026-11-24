@@ -50,7 +50,7 @@ class RefreshTokenStoreTest {
     void testPutDelegatesToKeyValueStore() throws IOException {
         refreshTokenStore.put("tokenKey", "refreshToken123");
 
-        verify(keyValueStore).put("tokenKey", "refreshToken123");
+        verify(keyValueStore).put("tokenKey", "REDACTED_SECRET");
     }
 
     @Test
